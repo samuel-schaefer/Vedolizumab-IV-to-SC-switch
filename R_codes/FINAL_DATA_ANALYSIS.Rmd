@@ -74,47 +74,6 @@ write.table(data, file="../Input/Cleaned_data_set.txt", sep="\t", col.names = T,
 rm(dataset)
 ```
 
-# Check for missing values - could be excluded later
-
-```{r missing values}
-baseline_parameters <- c("Studieid","Studienummer","Diagnos","Ålder_baseline","Ålder_vid_diagnos","Längd_baseline",
-                         "vikt_baseline","CRP_baseline","Alb_baseline","Rökning","Utbredning_UC","Disease_location_CD",
-                         "Disease_behaviour_CD","LKM_baseline","IV_Vedo_interval","Tid_IV_Vedo")
-
-#(Dose_optimisation) = "Tid_IV_Vedo"
-#(BMI_baseline) = "vikt_baseline" / "Längd_baseline"^2
-#(Sjukdomsduration_baseline) = "Ålder_baseline","Ålder_vid_diagnos"
-
-interval_parameters <- c("Studieid","Diagnos",
-                         "kalprotektin_baseline","kalprotektin_mån3","Kalpro_mån12",
-                         "HBI_baseline","HBI_3mån","HBI_12mån",
-                         "PRO2_CD_Baseline","PRO2_CD_3mån","PRO2_CD_12mån",
-                         "PRO2_UC_numeric_baseline","PRO2_UC_numeric_3mån","PRO2_UC_numeric_12mån",
-                         "SCCAI","SCCAI_3mån","SCCAI_12mån",
-                         "Vedolizumab_baseline","Vedolizumab_mån3","Vedolizumab_mån12")
-
-#(kalpro_baseline_remission) = "kalprotektin_baseline" < 50
-#(kalpro_remission_3mån) = "kalprotektin_mån3" < 50
-#(kaplro_12mån_remission) = "Kalpro_mån12" < 50
-
-baseline_parameters <- data[,baseline_parameters]
-levels(baseline_parameters$Disease_behaviour_CD) <- c(levels(baseline_parameters$Disease_behaviour_CD), F)
-baseline_parameters[baseline_parameters$Diagnos == "ulcerös kolit",]$Disease_behaviour_CD <- F
-levels(baseline_parameters$Disease_location_CD) <- c(levels(baseline_parameters$Disease_location_CD), F)
-baseline_parameters[baseline_parameters$Diagnos == "ulcerös kolit",]$Disease_location_CD <- F
-levels(baseline_parameters$Utbredning_UC) <- c(levels(baseline_parameters$Utbredning_UC), F)
-baseline_parameters[baseline_parameters$Diagnos == "crohns sjukdom",]$Utbredning_UC <- F
-
-baseline_parameters <- is.na(baseline_parameters)
-rowSums(baseline_parameters)
-
-
-interval_parameters <- data[,interval_parameters]
-interval_parameters <- is.na(interval_parameters)
-rowSums(interval_parameters)
-```
-
-
 # General function for statistics
 
 For numeric data a ANOVA for normally distributed data and Friedmans's test for non-parametric data.
