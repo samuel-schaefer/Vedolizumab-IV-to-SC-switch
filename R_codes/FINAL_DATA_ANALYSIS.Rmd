@@ -1,0 +1,2074 @@
+---
+title: "Exclude patients with many missing values"
+author: "Samuel Schäfer"
+date: "2024-05-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo = F}
+knitr::opts_chunk$set(collapse = TRUE, echo = T, comment = "#>")
+
+library(memisc)
+library(dplyr)
+library(readxl)
+library(summarytools)
+library(pastecs)
+library(plyr)
+library(reshape2)
+library(rstatix)
+library(doParallel)
+library(Partiallyoverlapping)
+library(rcompanion)
+library(ggpubr)
+library(ggsankey)
+library(ggplot2)
+library(ggalluvial)
+library(dplyr)
+
+
+dir.create(path = "../Figure 2 statistics", showWarnings = F)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# SPSS data
+
+```{r input}
+# Load SPSS data set
+dataset <- as.data.set(spss.system.file("../Input/DataSet4 UCCD.sav Dec 27 2023.sav", ))
+dataset <- deduplicate_labels(dataset, method = "prefix")
+
+# Remove undefined IBD 
+data <- as.data.frame(dataset)
+data <- data[data$Diagnos != "obestämbar kolit",]
+data$Vedolizumab_baseline <- as.numeric(gsub(pattern = ",", replacement = ".",  x = as.character(data$Vedolizumab_baseline), fixed = T))
+
+treatment <- readxl::read_xlsx(path = "../Input/Månader på iv vedo behandling.xlsx")
+treatment <- as.matrix(treatment)
+treatment[treatment[,2] == "N/A",2] <- NA
+switch <- readxl::read_xlsx(path = "../Input/byte av behandling efter byte.xlsx")
+data <- cbind(data, treatment[match(as.character(data$Studienummer),as.character(treatment[,1])),])
+
+temp <- which(duplicated(data$Studieid))
+data[temp-1,]$Studieid <- paste(data[temp-1,]$Studieid, "A",sep="")
+data[temp,]$Studieid <- paste(data[temp,]$Studieid, " B",sep="")
+data$Studienummer <- factor(data$Studieid, levels = unique(data$Studieid))
+
+# ADD PRO2 UC DATA
+pro2_add <- as.matrix(readxl::read_xlsx(path = "../Input/Kopia av Datainmatning till Entyvio studien HH_240208.xlsx", sheet = "SHS Visit"))
+pro2_add2 <- as.matrix(readxl::read_xlsx(path = "../Input/Kopia av Datainmatning till Entyvio studien HH inkl index_240208.xlsx", sheet = "SHS M3"))
+pro2_add3 <- as.matrix(readxl::read_xlsx(path = "../Input/Kopia av Datainmatning till Entyvio studien HH inkl index_240208.xlsx", sheet = "SHS M12"))
+pro2_add <- pro2_add[-c(1:6),c(1,22)]
+pro2_add2 <- pro2_add2[-c(1:6),c(1,23)]
+pro2_add3 <- pro2_add3[-c(1:6),c(1,22)]
+# Filter out "999" (missing values)
+pro2_add[which(pro2_add[,2] == 999),2] <- NA
+pro2_add2[which(pro2_add2[,2] == 999),2] <- NA
+pro2_add3[which(pro2_add3[,2] == 999),2] <- NA
+data <- cbind(data, 
+              PRO2_UC_numeric_baseline = pro2_add[match(as.character(data$Studienummer),as.character(pro2_add[,1])),2],
+              PRO2_UC_numeric_3mån = pro2_add2[match(as.character(data$Studienummer),as.character(pro2_add2[,1])),2],
+              PRO2_UC_numeric_12mån = pro2_add3[match(as.character(data$Studienummer),as.character(pro2_add3[,1])),2])
+rm(pro2_add, pro2_add2, pro2_add3, switch, temp, treatment)
+
+write.table(data, file="../Input/Cleaned_data_set.txt", sep="\t", col.names = T, row.names = F)
+rm(dataset)
+```
+
+# Check for missing values - could be excluded later
+
+```{r missing values}
+baseline_parameters <- c("Studieid","Studienummer","Diagnos","Ålder_baseline","Ålder_vid_diagnos","Längd_baseline",
+                         "vikt_baseline","CRP_baseline","Alb_baseline","Rökning","Utbredning_UC","Disease_location_CD",
+                         "Disease_behaviour_CD","LKM_baseline","IV_Vedo_interval","Tid_IV_Vedo")
+
+#(Dose_optimisation) = "Tid_IV_Vedo"
+#(BMI_baseline) = "vikt_baseline" / "Längd_baseline"^2
+#(Sjukdomsduration_baseline) = "Ålder_baseline","Ålder_vid_diagnos"
+
+interval_parameters <- c("Studieid","Diagnos",
+                         "kalprotektin_baseline","kalprotektin_mån3","Kalpro_mån12",
+                         "HBI_baseline","HBI_3mån","HBI_12mån",
+                         "PRO2_CD_Baseline","PRO2_CD_3mån","PRO2_CD_12mån",
+                         "PRO2_UC_numeric_baseline","PRO2_UC_numeric_3mån","PRO2_UC_numeric_12mån",
+                         "SCCAI","SCCAI_3mån","SCCAI_12mån",
+                         "Vedolizumab_baseline","Vedolizumab_mån3","Vedolizumab_mån12")
+
+#(kalpro_baseline_remission) = "kalprotektin_baseline" < 50
+#(kalpro_remission_3mån) = "kalprotektin_mån3" < 50
+#(kaplro_12mån_remission) = "Kalpro_mån12" < 50
+
+baseline_parameters <- data[,baseline_parameters]
+levels(baseline_parameters$Disease_behaviour_CD) <- c(levels(baseline_parameters$Disease_behaviour_CD), F)
+baseline_parameters[baseline_parameters$Diagnos == "ulcerös kolit",]$Disease_behaviour_CD <- F
+levels(baseline_parameters$Disease_location_CD) <- c(levels(baseline_parameters$Disease_location_CD), F)
+baseline_parameters[baseline_parameters$Diagnos == "ulcerös kolit",]$Disease_location_CD <- F
+levels(baseline_parameters$Utbredning_UC) <- c(levels(baseline_parameters$Utbredning_UC), F)
+baseline_parameters[baseline_parameters$Diagnos == "crohns sjukdom",]$Utbredning_UC <- F
+
+baseline_parameters <- is.na(baseline_parameters)
+rowSums(baseline_parameters)
+
+
+interval_parameters <- data[,interval_parameters]
+interval_parameters <- is.na(interval_parameters)
+rowSums(interval_parameters)
+```
+
+
+# General function for statistics
+
+For numeric data a ANOVA for normally distributed data and Friedmans's test for non-parametric data.
+If significant, post-hoc tests will be calculated by paired t-test and partially paired t-testor a paired Wilcoxon sign rank test.
+
+For categorical data, chi-square will be calculated. post-hoc tests will be calculated by McNemars test (given that this is paired data). 
+
+
+```{r stats function}
+stats <- function(group, values, id, name, numeric = T) {
+  
+  if(numeric){
+    values <- as.numeric(as.character(values))
+    df <- data.frame(values = values, group = as.character(group))
+    df$group <- factor(group, levels = unique(group))
+    df$id <- factor(as.character(id), levels = unique(id))
+    
+    #Density
+    p <- ggdensity(data = df, x = "values", add = "mean", color = "group", fill = "group") + 
+      geom_density()
+    ggsave(filename = paste(name, "_time_point_density_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Q-Q plot
+    p <- ggqqplot(data = df, x = "values", add = "mean", color = "group", fill = "group")
+    ggsave(filename = paste(name, "_time_point_Q-Q_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Histogram
+    mu <- ddply(df, "group", summarise, grp.mean=mean(values))
+    p <- ggplot(data = df, aes(x = values, color = group, fill = group)) + 
+      geom_histogram(position = "identity", alpha = 0.5) +
+      geom_vline(data = mu, aes(xintercept = grp.mean, color = group), linetype = "dashed")
+    ggsave(filename = paste(name, "_time_point_histogram.pdf",sep=""), plot = p, device = "pdf")
+    
+    if(length(unique(group))>2){
+      # Shapiro-Wilk normality test
+      shapiro <- aggregate(df$values, by = list(df$group), FUN = function(x) {shapiro.test(x)$p.value})
+      shapiro <- cbind(Group = as.character(shapiro[[1]]), shapiro[[2]])
+      
+      # PARAMETRIC
+      # ANOVA 
+      anova <- anova_test(data = df, dv = values, wid = id, within = group)$ANOVA$p
+      
+      # Paired T-test
+      ttest <- unlist(pairwise.t.test(x = df$values, g = df$group, paired = T, na.action = "na.omit", p.adjust.method="bonferroni"))[3:4]
+      
+      # Partially overlapping t-test (paired and unpaired observations)
+      df2 <- dcast(df,  id ~ group, value.var= "values") 
+      partover <- foreach(i = c(3:4), .combine = "c") %do% {
+        temp <- Partover.test(
+                                x1 = df2[intersect(which(!is.na(df2[,2])), which(is.na(df2[,i]))),2], # unpaired values sample 1
+                                x2 = df2[intersect(which(is.na(df2[,2])), which(!is.na(df2[,i]))),i], # unpaired values sample 2
+                                x3 = df2[intersect(which(!is.na(df2[,2])), which(!is.na(df2[,i]))),2], # paired values sample 1
+                                x4 = df2[intersect(which(!is.na(df2[,2])), which(!is.na(df2[,i]))),i], # paired values sample 2
+                                var.equal = T
+                              )
+        return(temp$p.value)
+      }
+      
+      # NONPARAMETRIC
+      # Friedmans test
+      friedman <- friedman.test(blocks=df$id, groups=df$group, y=df$values)$p.value
+      
+      # Paired Wilcoxon sign rank test
+      wilcoxon <- unlist(pairwise.wilcox.test(df$values, df$group, exact = F, p.adjust.method = "bonferroni", paired = T))[3:4]
+      
+    } else {
+      partover <- ttest <- wilcoxon <- c(NA, NA)
+      anova <- friedman <- NA
+      shapiro <- matrix(NA, ncol = 1, nrow = 3)
+    }
+    
+    # summary
+    summary <- as.data.frame(aggregate(df$values, by = list(df$group), FUN = function(x) {stat.desc(x)}))
+    summary <- cbind(Group = as.character(summary[[1]]), summary[[2]])
+    
+    q1 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,1/4, na.rm = T)}))[[2]]
+    q3 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,3/4, na.rm = T)}))[[2]]
+    
+    out <- cbind(summary,
+                 Q1=q1,
+                 Q3=q3,
+                 shapiro_pval = shapiro[,-1],
+                 Anova= c(anova, NA, NA),
+                 t_test_pval = c(NA, ttest),
+                 partial_t_test = c(NA, partover),
+                 Friedman = c(friedman, NA, NA),
+                 wilcoxon_sign_rank_pval = c(NA,wilcoxon))
+    return(out)
+    
+  } else {
+    
+    df <- data.frame(values = values, group = as.character(group))
+    df$group <- factor(group, levels = unique(group))
+    df$id <- factor(as.character(id), levels = unique(id))
+    
+    group <- factor(group, levels = unique(group))
+    ctable <- table(values, group)
+    ctable_perc <- 100*t(t(ctable)/colSums(ctable))
+    ctable_perc <- round(ctable_perc,1)
+
+    df2 <- melt(ctable_perc)
+    p <- ggplot(data = df2, aes(x = group, y = value, fill = values)) +
+      geom_bar(stat = "identity") +
+      ylab("Proportion (%)") +
+      xlab(NULL) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    ggsave(filename = paste(name, "_stacked_bar_plot.pdf",sep=""), plot = p, device = "pdf")
+
+    chi2 <- chisq.test(values, group, correct = F)$p.value
+    
+    chochran_q <- cochran_qtest(data = df, formula = values ~ group | id)$p.value
+    
+    pair_mcnemar <- pairwiseMcnemar(data = df, x = values, g = group, block = id, test = "exact", digits = 5, method = "bonferroni", correct = T)$Pairwise[,c("Comparison","p.adjust")]
+    
+    out <- cbind(ctable[,1], ctable_perc[,1],
+                 ctable[,2], ctable_perc[,2],
+                 ctable[,3], ctable_perc[,3],
+                 c(chi2, rep(NA, times = nrow(ctable)-1)),
+                 c(chochran_q, rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[1,2],rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[2,2],rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[3,2],rep(NA, times = nrow(ctable)-1))
+                 )
+    colnames(out) <- c(colnames(ctable)[1],paste(colnames(ctable)[1], "_%",sep=""),
+                       colnames(ctable)[2],paste(colnames(ctable)[2], "_%",sep=""),
+                       colnames(ctable)[3],paste(colnames(ctable)[3], "_%",sep=""),
+                       "Chi2_P", "Chochrane_q_test", paste("McNemar_p_value ",pair_mcnemar[,1],sep=""))
+    return(out)
+  }
+}
+
+```
+
+```{r group function}
+group <- function(x1, x2, x3, id, min_observations_x = 0) {
+  out <- data.frame(x1 = as.numeric(as.character(x1)),
+                     x2 = as.numeric(as.character(x2)),
+                     x3 = as.numeric(as.character(x3)),
+                     id = id)
+  if(min_observations_x > 0){
+    out <- out[rowSums(!is.na(out[,1:3]))>= min_observations_x,]
+  }
+  out <- melt(data = out, id.vars = list("id"))
+  return(out)
+}
+```
+
+```{r groupcat function}
+groupcat <- function(x1, x2, x3, id, min_observations_x = 0) {
+  out <- data.frame(x1 = as.character(x1),
+                     x2 = as.character(x2),
+                     x3 = as.character(x3),
+                     id = id)
+  if(min_observations_x > 0){
+    out <- out[rowSums(!is.na(out[,1:3]))>= min_observations_x,]
+  }
+  out <- melt(data = out, id.vars = list("id"))
+  return(out)
+}
+```
+
+
+# ###############################################################################
+# # 
+# # FIGURE 2 statistics
+# # 
+# ###############################################################################
+
+```{r fig 2}
+dir.create("../Figure 2 statistics/")
+dir.create("../Figure 2 plots/")
+```
+
+# Numerical variables
+
+## Calprotektin
+```{r fig 2 calpro}
+temp <- group(x1 = data$kalprotektin_baseline,
+              x2 = data$kalprotektin_mån3,
+              x3 = data$Kalpro_mån12,
+              id = data$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Figure 2 statistics/Calpro_all", numeric = T)
+
+temp <- cbind(variable = rep("Calpro_all", times = nrow(temp)), temp)
+summary <- temp
+temp
+```
+
+```{r fig 2 calpro CD}
+disease <- "crohns sjukdom"
+name <- "Calpro_CD"
+temp <- group(x1 = data[data$Diagnos == disease,]$kalprotektin_baseline,
+              x2 = data[data$Diagnos == disease,]$kalprotektin_mån3,
+              x3 = data[data$Diagnos == disease,]$Kalpro_mån12,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 2 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+```{r fig 2 calpro UC}
+disease <- "ulcerös kolit"
+name <- "Calpro_UC"
+temp <- group(x1 = data[data$Diagnos == disease,]$kalprotektin_baseline,
+              x2 = data[data$Diagnos == disease,]$kalprotektin_mån3,
+              x3 = data[data$Diagnos == disease,]$Kalpro_mån12,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 2 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary,temp)
+write.table(x = summary, file = "../Figure 2 statistics/Numerical_stats.txt",sep="\t", row.names = T, col.names = NA)
+temp
+```
+
+# Categorical variables
+
+## Calprotektin remission
+```{r fig 2 calpro remission}
+temp <- groupcat(x1 = data$kalpro_baseline_remission,
+              x2 = data$kalpro_remission_3mån,
+              x3 = data$kaplro_12mån_remission,
+              id = data$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Clinical_remission_all", numeric = F)
+
+temp <- cbind(variable = rep("Clinical_remission_all", times = nrow(temp)), temp)
+summary_cat <- temp
+write.table(summary_cat, file ="../Figure 2 statistics/Categorical_stats.txt", sep="\t", row.names = T, col.names = NA)
+temp
+```
+
+# ###############################################################################
+# # 
+# # FIGURE 2 plots
+# # 
+# ###############################################################################
+
+F-calpro levels and  remission (calpro <150 ug/g) vs 3 months and 12 months - boxplot + sankey
+
+```{r fig 2 plots}
+# Calpro levels
+temp <- data[,c("Diagnos","kalprotektin_baseline", "kalprotektin_mån3", "Kalpro_mån12")]
+colnames(temp) <- c("Group", "Baseline", "3 months", "12 months")
+temp <- temp[rowSums(!is.na(temp[2:4]))>=2,] # exclude patients with less than 2 data points
+df <- melt(temp, measure.vars = 2:4)
+
+df$value <- as.numeric(as.character(df$value))
+df$variable <- factor(as.character(df$variable), levels = c("Baseline", "3 months", "12 months"), ordered = T)
+df$Group <- factor(as.character(df$Group), levels = c("crohns sjukdom","ulcerös kolit"), ordered = T)
+df <- df[!is.na(df$Group),]
+
+df2 <- df
+df2$Group <- "All"
+df$Group <- factor(as.character(df$Group), levels = c("All", "crohns sjukdom","ulcerös kolit"), ordered = T)
+df <- rbind(df, df2)
+
+ID <- vector()
+for(i in 1:nrow(df)){
+  if(df[i,1] != "All"){
+    if(df[i,1] == "crohns sjukdom"){
+      ID[i] <- paste("CD_", df[i,2],sep="")
+    } else {
+      ID[i] <- paste("UC_", df[i,2],sep="")
+    }
+  } else {
+    ID[i] <- as.character(df[i,2])
+  }
+}
+df$variable <- factor(as.character(ID), levels = c("Baseline", "3 months", "12 months", 
+                                                   "CD_Baseline", "CD_3 months", "CD_12 months",
+                                                   "UC_Baseline", "UC_3 months", "UC_12 months"), ordered = T)
+
+colors <- c("navyblue","#4F7942","#660000","#2b58a3","#BFE890","#e7772b","#2f9da7","#AFE1AF","#e8c124") 
+colors <- colors[c(seq(2, 9, by = 3), seq(3,9, by = 3), seq(1, 9, by = 3))]
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_boxplot(linewidth = 0.75, colour = "black") +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(values=colors) +
+  ylab("Calprotectin ug/g (log10)") +
+  xlab(NULL) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1,1,0,1), "cm"))
+
+ggsave(filename = "../Figure 2 plots/Calprotectin_by_group_over_time_boxplot.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+kalpro <- p + theme(axis.text.x = element_blank())
+
+
+
+# Remission by Calprotectin levels
+temp <- data[,c("Diagnos", "kalpro_baseline_remission", "kalpro_remission_3mån", "kaplro_12mån_remission")]
+temp <- temp[rowSums(!is.na(temp[2:4]))>=2,] # exclude patients with less than 2 data points
+colnames(temp) <- c("Group", "Baseline", "3 months", "12 months")
+for(i in 1:ncol(temp)){
+  facna <- addNA(temp[,i])
+  levels(facna) <- c(levels(temp[,i]), "Missing")
+  temp[,i] <- facna
+}
+
+# ALL
+df <- temp %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / nrow(temp)
+
+# CD
+df2 <- temp[temp[,1] == "crohns sjukdom",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x <- paste("CD_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,1] == "crohns sjukdom")
+
+# UC
+df3 <- temp[temp[,1] == "ulcerös kolit",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes3 <- to_lodes_form(df3, axes = 1:3, id = "Cohort")
+lodes3$Cohort <- lodes3$Cohort + max(lodes2$Cohort)
+lodes3$x <- paste("UC_",as.character(lodes3$x),sep="")
+lodes3$stratum <- factor(x = as.character(lodes3$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes3$n <- 100* as.numeric(lodes3$n) / sum(temp[,1] == "ulcerös kolit")
+
+# COMBINED
+lodes <- rbind(lodes, lodes2, lodes3)
+
+#color2 <- color2
+#color2 <- c("#d6604d", "#ebe6e3", "#2166ac")
+#color2 <- c("#d04934", "#ebe6e3", "#1b479e")
+color2 <- c("#d95b26", "#ccc0b8", "#2b58a3")
+
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [<150 ug/g] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(0.5,1,0,1), "cm"))
+
+
+ggsave(filename = "../Figure 2 plots/Disease_activity_by_calprotectin_level_over_time_sankey_ALL_COMBINED.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+kalpro_remission <- p
+
+# COMBINATION
+#######################################################################
+p <- ggarrange(kalpro, kalpro_remission, labels = c("a)", "b)"), ncol = 1, nrow = 2)
+ggsave(filename = "../Figure 2 plots/FIGURE2_unedited.pdf",plot = p, device = "pdf", width = 17.5, height = 15, units = "cm")
+
+plot(p)
+```
+
+
+
+# ################################################################################
+# # 
+# FIGURE 3 statistics
+# # 
+# ################################################################################
+
+```{r fig 3}
+dir.create("../Figure 3 statistics/")
+dir.create("../Figure 3 plots/")
+```
+
+## Fig 3a - HBI in CD patients
+
+```{r fig 3a}
+disease <- "crohns sjukdom"
+name <- "HBI_CD"
+temp <- group(x1 = data[data$Diagnos == disease,]$HBI_baseline,
+              x2 = data[data$Diagnos == disease,]$HBI_3mån,
+              x3 = data[data$Diagnos == disease,]$HBI_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 3 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- temp
+temp
+```
+
+## Fig3b - PRO2 CD
+
+```{r fig 3b}
+disease <- "crohns sjukdom"
+name <- "PRO2_CD"
+temp <- group(x1 = data[data$Diagnos == disease,]$PRO2_CD_Baseline,
+              x2 = data[data$Diagnos == disease,]$PRO2_CD_3mån,
+              x3 = data[data$Diagnos == disease,]$PRO2_CD_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 3 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary,temp)
+temp
+```
+
+## Fig3e - SCCAI UC
+
+```{r fig 3e}
+disease <- "ulcerös kolit"
+name <- "SCCAI_UC"
+temp <- group(x1 = data[data$Diagnos == disease,]$SCCAI,
+              x2 = data[data$Diagnos == disease,]$SCCAI_3mån,
+              x3 = data[data$Diagnos == disease,]$SCCAI_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 3 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary,temp)
+temp
+```
+
+## Fig3f - PRO2 UC
+
+```{r fig 3f}
+disease <- "ulcerös kolit"
+name <- "PRO2_UC"
+temp <- group(x1 = data[data$Diagnos == disease,]$PRO2_UC_numeric_baseline,
+              x2 = data[data$Diagnos == disease,]$PRO2_UC_numeric_3mån,
+              x3 = data[data$Diagnos == disease,]$PRO2_UC_numeric_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 3 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary,temp)
+temp
+```
+
+## SAVE
+```{r fig 3 save}
+write.table(x = summary, file = "../Figure 3 statistics/Numerical_stats.txt",sep="\t", row.names = T, col.names = NA)
+```
+
+# Categorical data
+
+## Fig 3c - HBI remission
+```{r fig 3c}
+temp <- data[data$Diagnos == "crohns sjukdom",c("HBI_baseline", "HBI_3mån", "HBI_12mån")]
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:3), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 4] <- "Remission"
+  temp2[temp[,i] > 4] <- "Relapse"
+  return(temp2)
+}
+temp <- cbind(as.character(data$Studienummer), out)
+colnames(temp) <- c("ID","Baseline", "3 months", "12 months")
+
+temp <- groupcat(x1 = temp[,2],x2 = temp[,3],x3 = temp[,4],id = temp[,1])
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Figure 3 statistics/HBI_remission_CD", numeric = F)
+
+temp <- cbind(variable = rep("HBI_remission_CD", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+```
+
+## Fig 3d - PRO2 CD remission
+```{r fig 3d}
+temp <- data[data$Diagnos == "crohns sjukdom",c("PRO2_CD_Baseline", "PRO2_CD_3mån", "PRO2_CD_12mån")]
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 11] <- "Remission"
+  temp2[temp[,i] > 11] <- "Relapse"
+  return(temp2)
+}
+temp <- cbind(as.character(data$Studienummer), out)
+colnames(temp) <- c("ID","Baseline", "3 months", "12 months")
+
+temp <- groupcat(x1 = temp[,2],x2 = temp[,3],x3 = temp[,4],id = temp[,1])
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Figure 3 statistics/PRO2_remission_CD", numeric = F)
+
+temp <- cbind(variable = rep("PRO2_remission_CD", times = nrow(temp)), temp)
+summary_cat <- cbind(summary_cat, temp)
+temp
+```
+
+## Fig 3g - SCCAI UC remission
+```{r fig 3g}
+temp <- data[data$Diagnos == "ulcerös kolit",c("SCCAI", "SCCAI_3mån", "SCCAI_12mån")]
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 2] <- "Remission"
+  temp2[temp[,i] > 2] <- "Relapse"
+  return(temp2)
+}
+temp <- cbind(as.character(data$Studienummer), out)
+colnames(temp) <- c("ID","Baseline", "3 months", "12 months")
+
+temp <- groupcat(x1 = temp[,2],x2 = temp[,3],x3 = temp[,4],id = temp[,1])
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Figure 3 statistics/SCCAI_remission_UC", numeric = F)
+
+temp <- cbind(variable = rep("SCCAI_remission_UC", times = nrow(temp)), temp)
+summary_cat <- cbind(summary_cat, temp)
+temp
+```
+
+## Fig 3h - PRO2 UC remission
+```{r fig 3h}
+temp <- data[data$Diagnos == "ulcerös kolit",c("PRO2_UC_numeric_baseline", "PRO2_UC_numeric_3mån", "PRO2_UC_numeric_12mån")] # no numerical values
+temp$PRO2_UC_numeric_baseline <- as.numeric(as.character(temp$PRO2_UC_numeric_baseline))
+temp$PRO2_UC_numeric_3mån <- as.numeric(as.character(temp$PRO2_UC_numeric_3mån))
+temp$PRO2_UC_numeric_12mån <- as.numeric(as.character(temp$PRO2_UC_numeric_12mån))
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+temp <- as.matrix(temp)
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] == 0] <- "Remission"
+  temp2[temp[,i] > 0] <- "Relapse"
+  return(temp2)
+}
+temp <- cbind(as.character(data$Studienummer), out)
+colnames(temp) <- c("ID","Baseline", "3 months", "12 months")
+
+temp <- groupcat(x1 = temp[,2],x2 = temp[,3],x3 = temp[,4],id = temp[,1])
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Figure 3 statistics/PRO2_remission_UC", numeric = F)
+
+temp <- cbind(variable = rep("PRO2_remission_UC", times = nrow(temp)), temp)
+summary_cat <- cbind(summary_cat, temp)
+temp
+```
+
+## SAVE
+```{r fig 3 cat save}
+write.table(x = summary_cat, file = "../Figure 3 statistics/Categorical_stats.txt",sep="\t", row.names = T, col.names = NA)
+```
+
+
+# ################################################################################
+# # 
+# FIGURE 3 plots
+# # 
+# ################################################################################
+
+```{r fig 3 plots}
+# HBI for only CD patients - boxplots
+temp <- data[data$Diagnos == "crohns sjukdom",c("HBI_baseline", "HBI_3mån", "HBI_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+for(i in 1:ncol(temp)){
+  facna <- addNA(temp[,i])
+  levels(facna) <- c(levels(temp[,i]), "Missing")
+  temp[,i] <- as.character(facna)
+}
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- melt(cbind(Group = "A", temp), id.vars = "Group")
+df <- df[df[,3] != "Missing",]
+df[,3] <- as.numeric(df[,3])
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) +
+  geom_boxplot(linewidth = 0.75, color = "black") +
+  #geom_dotplot(binaxis='y', stackdir='center', dotsize=0.5, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("pHBI") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[4:6]) +
+  scale_fill_manual(values = colors[4:6]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", face = "bold", size = 10),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/HBI_over_time_boxplot_CD.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+hbi_cd <- p
+
+# HBI over time - violin
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_violin(trim=FALSE) + 
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=0.75, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("pHBI") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[4:6]) +
+  scale_fill_manual(values = colors[4:6]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/HBI_over_time_violin_CD.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+
+
+# Stacked bar plot
+temp <- data[data$Diagnos == "crohns sjukdom",c("HBI_baseline", "HBI_3mån", "HBI_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 4] <- "Remission"
+  temp2[temp[,i] > 4] <- "Relapse"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- out
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- foreach(i = c(1:ncol(temp)), .combine = "rbind") %do% {
+  temp2 <- table(temp[,i])
+  temp2 <- cbind(colnames(temp)[i], names(temp2), temp2)
+}
+colnames(df) <- c("time","disease", "n")
+df <- as.data.frame(df)
+
+df$time <- factor(df$time, levels = c("Baseline", "3 months", "12 months"), ordered = T)
+df$disease <- factor(df$disease, levels = c("Relapse", "Missing", "Remission"), ordered = T)
+df$n <- 100 * as.numeric(as.character(df$n)) / nrow(temp)
+
+
+p <- ggplot(df, aes(x=time, y = n, fill = disease)) + 
+  geom_bar(position="fill", stat = "identity", linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,1,0.25), labels = c(0,25,50,75,100)) +
+  ylab("% of patients") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+
+ggsave(filename = "../Figure 3 plots/Disease_activity_by_HBI_over_time_stacked_barplot_CD_only.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+
+
+# SANKEY
+temp <- data[data$Diagnos == "crohns sjukdom",c("HBI_baseline", "HBI_3mån", "HBI_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 4] <- "Remission"
+  temp2[temp[,i] > 4] <- "Relapse"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- out
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- as.data.frame(temp) %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("Relapse", "Missing", "Remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / nrow(temp)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [pHBI <= 4] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/HBI_remission_sankey_CD.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+HBI_remission <- p
+
+
+# PRO2 for only CD patients 
+#######################################################################
+
+
+# PRO2CD over time - boxplot
+temp <- data[data$Diagnos == "crohns sjukdom",c("PRO2_CD_Baseline", "PRO2_CD_3mån", "PRO2_CD_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+for(i in 1:ncol(temp)){
+  facna <- addNA(temp[,i])
+  levels(facna) <- c(levels(temp[,i]), "Missing")
+  temp[,i] <- facna
+}
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- melt(cbind(Group = "A", temp), id.vars = "Group")
+df <- df[!is.na(df[,3]),]
+df[,3] <- as.numeric(df[,3])
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_boxplot(linewidth = 0.75, color = "black") +
+  #geom_dotplot(binaxis='y', stackdir='center', dotsize=0.5, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("PRO2-CD") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[4:6]) +
+  scale_fill_manual(values = colors[4:6]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+  
+ggsave(filename = "../Figure 3 plots/PRO2CD_over_time_boxplot.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+pro2cd <- p
+
+
+# PRO2CD over time - violin
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_violin(trim=FALSE) + 
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=1, fill = "black")+ 
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("PRO2-CD") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[4:6]) +
+  scale_fill_manual(values = colors[4:6]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/PRO2CD_over_time_violin.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+
+
+# PROCD2 over time - SANKEY
+
+temp <- data[data$Diagnos == "crohns sjukdom",c("PRO2_CD_Baseline", "PRO2_CD_3mån", "PRO2_CD_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 11] <- "Remission"
+  temp2[temp[,i] > 11] <- "Relapse"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- out
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- as.data.frame(temp) %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("Relapse", "Missing", "Remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / nrow(temp)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [PRO2-CD<=11] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/PRO2CD_remission_sankey.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+PRO2_CD_remission <- p
+
+
+# SCCAI for UC only
+#######################################################################
+
+
+# SCCAI over time - boxplot
+temp <- data[data$Diagnos == "ulcerös kolit",c("SCCAI", "SCCAI_3mån", "SCCAI_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+for(i in 1:ncol(temp)){
+  facna <- addNA(temp[,i])
+  levels(facna) <- c(levels(temp[,i]), "Missing")
+  temp[,i] <- as.character(facna)
+}
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- melt(cbind(Group = "A", temp), id.vars = "Group")
+df <- df[df[,3] != "Missing",]
+df[,3] <- as.numeric(df[,3])
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) +
+  geom_boxplot(linewidth = 0.75, color = "black") +
+  #geom_dotplot(binaxis='y', stackdir='center', dotsize=0.5, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("SCCAI") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[7:9]) +
+  scale_fill_manual(values = colors[7:9]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/SCCAI_over_time_UC_boxplot.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+sccai <- p
+
+# SCCAI over time - violin
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_violin(trim=FALSE) + 
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=0.75, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("SCCAI") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[7:9]) +
+  scale_fill_manual(values = colors[7:9]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/SCCAI_over_time_violin.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+
+
+# SCCAI remission - sankey
+
+temp <- data[data$Diagnos == "ulcerös kolit",c("SCCAI", "SCCAI_3mån", "SCCAI_12mån")]
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp <- as.matrix(temp)
+mode(temp) <- "numeric"
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] <= 2] <- "Remission"
+  temp2[temp[,i] > 2] <- "Relapse"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- out
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- as.data.frame(temp) %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("Relapse", "Missing", "Remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / nrow(temp)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [SCCAI <= 2] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/SCCAI_remission_UC_sankey.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+sccai_remission <- p
+
+
+# PRO2 for only UC patients 
+#######################################################################
+
+# PRO2 UC over time - boxplot
+temp <- data[data$Diagnos == "ulcerös kolit",c("PRO2_UC_numeric_baseline", "PRO2_UC_numeric_3mån", "PRO2_UC_numeric_12mån")] 
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp$PRO2_UC_numeric_baseline <- as.numeric(as.character(temp$PRO2_UC_numeric_baseline))
+temp$PRO2_UC_numeric_3mån <- as.numeric(as.character(temp$PRO2_UC_numeric_3mån))
+temp$PRO2_UC_numeric_12mån <- as.numeric(as.character(temp$PRO2_UC_numeric_12mån))
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- melt(cbind(Group = "A", temp), id.vars = "Group")
+# df <- df[!is.na(df[,3]),]
+# df[,3] <- as.numeric(df[,3])
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_boxplot(linewidth = 0.75, color = "black") +
+  #geom_dotplot(binaxis='y', stackdir='center', dotsize=0.5, fill = "black") +
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("PRO2-UC") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[7:9]) +
+  scale_fill_manual(values = colors[7:9]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/PRO2UC_over_time_boxplot.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+pro2uc <- p
+
+
+# PRO2UC over time - violin
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) + 
+  geom_violin(trim=FALSE) + 
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=1, fill = "black")+ 
+  scale_y_continuous(breaks = seq(0,25,5), labels = seq(0,25,5)) +
+  ylim(0,25) +
+  ylab("PRO2-CD") +
+  xlab(NULL) +
+  scale_color_manual(values = colors[7:9]) +
+  scale_fill_manual(values = colors[7:9]) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/PRO2UC_over_time_violin.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+
+# PRO2 UC over time - SANKEY
+temp <- data[data$Diagnos == "ulcerös kolit",c("PRO2_UC_numeric_baseline", "PRO2_UC_numeric_3mån", "PRO2_UC_numeric_12mån")] 
+temp <- temp[rowSums(!is.na(temp))>=2,] # exclude patients with less than 2 data points
+temp$PRO2_UC_numeric_baseline <- as.numeric(as.character(temp$PRO2_UC_numeric_baseline))
+temp$PRO2_UC_numeric_3mån <- as.numeric(as.character(temp$PRO2_UC_numeric_3mån))
+temp$PRO2_UC_numeric_12mån <- as.numeric(as.character(temp$PRO2_UC_numeric_12mån))
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+temp <- as.matrix(temp)
+
+out <- foreach(i= c(1:ncol(temp)), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[temp[,i] == 0] <- "Remission"
+  temp2[temp[,i] > 0] <- "Relapse"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- out
+colnames(temp) <- c("Baseline", "3 months", "12 months")
+
+df <- as.data.frame(temp) %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("Relapse", "Missing", "Remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / nrow(temp)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [PRO2-UC = 0] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 3 plots/PRO2UC_remission_sankey.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+PRO2_UC_remission <- p
+
+
+# COMBINATION
+#######################################################################
+p <- ggarrange(hbi_cd + theme(legend.position = "none"), 
+               pro2cd + theme(legend.position = "none"), 
+               HBI_remission + theme(legend.position = "none"), 
+               PRO2_CD_remission + theme(legend.position = "none"), 
+               sccai + theme(legend.position = "none"), 
+               pro2uc + theme(legend.position = "none"), 
+               sccai_remission + theme(legend.position = "none"), 
+               PRO2_UC_remission + theme(legend.position = "none"), 
+               labels = paste(letters[1:8], ")",sep=""), 
+               ncol = 2, nrow = 4)
+ggsave(filename = "../Figure 3 plots/FIGURE3_unedited.pdf",plot = p, device = "pdf", width = 17.5, height = 30, units = "cm")
+
+```
+
+
+# ################################################################################
+# # 
+# FIGURE 4 Dose optimisation - statistics
+# # 
+# ################################################################################
+
+```{r fig 4}
+dir.create("../Figure 4 statistics/")
+dir.create("../Figure 4 plots/")
+```
+
+# CALPROTECTIN fig 4a
+```{r fig 4a}
+treatment <- "8 weeks"
+name <- "Standard_IV_calpro"
+temp_standard <- temp <- group(x1 = data[data$Dose_optimisation == treatment,]$kalprotektin_baseline,
+              x2 = data[data$Dose_optimisation == treatment,]$kalprotektin_mån3,
+              x3 = data[data$Dose_optimisation == treatment,]$Kalpro_mån12,
+              id = data[data$Dose_optimisation == treatment,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 4 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+
+treatment <- "4-7"
+name <- "Optimized_IV_calpro"
+temp_optimized <- temp <- group(x1 = data[data$Dose_optimisation == treatment,]$kalprotektin_baseline,
+              x2 = data[data$Dose_optimisation == treatment,]$kalprotektin_mån3,
+              x3 = data[data$Dose_optimisation == treatment,]$Kalpro_mån12,
+              id = data[data$Dose_optimisation == treatment,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = paste("../Figure 4 statistics/", name, sep=""), numeric = T)
+
+temp <- cbind(variable = rep(name, times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+group_by(temp, variable) %>%
+  dplyr::summarise(
+    count = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    IQR = IQR(value, na.rm = TRUE)
+  )
+
+kruskal.test(value ~ variable, data = temp)
+```
+
+## SAVE
+```{r fig 4 save}
+write.table(x = summary, file = "../Figure 4 statistics/Numerical_stats.txt",sep="\t", row.names = T, col.names = NA)
+```
+
+# Categorical variables
+
+## Calprotektin remission - Fig4b
+```{r fig 4b}
+treatment <- "8 weeks"
+name <- "Standard_IV_calpro"
+temp_standard <- temp <- groupcat(x1 = data[data$Dose_optimisation == treatment,]$kalpro_baseline_remission,
+              x2 = data[data$Dose_optimisation == treatment,]$kalpro_remission_3mån,
+              x3 = data[data$Dose_optimisation == treatment,]$kaplro_12mån_remission,
+              id = data[data$Dose_optimisation == treatment,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Standard_IV_calpro_remission", numeric = F)
+
+temp <- cbind(variable = rep("Standard_IV_calpro_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+treatment <- "4-7"
+name <- "Optimized_IV_calpro"
+temp_optimized <- temp <- groupcat(x1 = data[data$Dose_optimisation == treatment,]$kalpro_baseline_remission,
+              x2 = data[data$Dose_optimisation == treatment,]$kalpro_remission_3mån,
+              x3 = data[data$Dose_optimisation == treatment,]$kaplro_12mån_remission,
+              id = data[data$Dose_optimisation == treatment,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Optimized_IV_calpro_remission", numeric = F)
+
+temp <- cbind(variable = rep("Optimized_IV_calpro_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+chisq.test(temp$value, temp$variable, correct = F)$p.value
+chisq.test(temp$value, temp$variable, correct = F)$stdres
+
+# Table
+table(temp$value, temp$variable)
+
+# Post-hoc testing using residuals = no specific significance between any one pair.
+alpha <- .05
+alpha_adj <- alpha/(2*6) # Bonferroni adjustment
+qnorm(alpha_adj/2)
+abs(chisq.test(temp$variable, temp$value, correct = F)$stdres) > abs(qnorm(alpha_adj/2))
+
+# Post-hoc testing by pair-by-pair comparison Chi2
+print("Post-hoc Chi2")
+unique_var <- unique(temp$variable)
+out <- foreach(i = c(1:(length(unique_var)-1)), .combine = "rbind") %do% {
+  out2 <- foreach(j = c((i+1):length(unique_var)), .combine = "rbind") %do% {
+    p <- chisq.test(temp[temp$variable %in% c(unique_var[i], unique_var[j]),]$variable, 
+               temp[temp$variable %in% c(unique_var[i], unique_var[j]),]$value, correct = F)$p.value
+    return(c(A = unique_var[i], B = unique_var[j], p = p))
+  }
+  return(out2)
+}
+out <- cbind(out, p_adj = as.numeric(out[,3]) * nrow(out))
+out[out[,4] > 1,4] <- 1
+out
+
+
+# Post-hoc testing by pair-by-pair comparison Fisher exact
+print("Post-hoc Fisher exact")
+unique_var <- unique(temp$variable)
+out <- foreach(i = c(1:(length(unique_var)-1)), .combine = "rbind") %do% {
+  out2 <- foreach(j = c((i+1):length(unique_var)), .combine = "rbind") %do% {
+    p <- fisher.test(table(temp[temp$variable %in% c(unique_var[i], unique_var[j]),]$variable, 
+               temp[temp$variable %in% c(unique_var[i], unique_var[j]),]$value))$p.value
+    return(c(A = unique_var[i], B = unique_var[j], p = p))
+  }
+  return(out2)
+}
+out <- cbind(out, p_adj = as.numeric(out[,3]) * nrow(out))
+out[out[,4] > 1,4] <- 1
+out
+```
+## pHBI remission CD patients - Fig4c
+
+```{r fig 4c}
+treatment <- "8 weeks"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="crohns sjukdom"))
+temp_standard <- temp <- groupcat(x1 = data[patients,]$HBI_baseline,
+              x2 = data[patients,]$HBI_3mån,
+              x3 = data[patients,]$HBI_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 4){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 4){
+    return("remission")
+  }
+}
+temp$value <- out
+
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Standard_IV_pHBI_remission", numeric = F)
+temp <- cbind(variable = rep("Standard_IV_pHBI_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+treatment <- "4-7"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="crohns sjukdom"))
+temp_optimized <- temp <- groupcat(x1 = data[patients,]$HBI_baseline,
+              x2 = data[patients,]$HBI_3mån,
+              x3 = data[patients,]$HBI_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+# No statistical test needed as all patients are in remission
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 4){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 4){
+    return("remission")
+  }
+}
+temp$value <- out
+
+# Chi2 test
+chisq.test(temp$value, temp$variable, correct = F)$p.value
+
+# Table
+table(temp$value, temp$variable)
+```
+
+## PRO2 CD remission CD patients - Fig4d
+
+```{r fig 4d}
+treatment <- "8 weeks"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="crohns sjukdom"))
+temp_standard <- temp <- groupcat(x1 = data[patients,]$PRO2_CD_Baseline,
+              x2 = data[patients,]$PRO2_CD_3mån,
+              x3 = data[patients,]$PRO2_CD_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 11){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 11){
+    return("remission")
+  }
+}
+temp$value <- out
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Standard_IV_PRO2_CD_remission", numeric = F)
+temp <- cbind(variable = rep("Standard_IV_PRO2_CD_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+treatment <- "4-7"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="crohns sjukdom"))
+temp_optimized <- temp <- groupcat(x1 = data[patients,]$PRO2_CD_Baseline,
+              x2 = data[patients,]$PRO2_CD_3mån,
+              x3 = data[patients,]$PRO2_CD_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+# No statistical test needed as all patients are in remission
+
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 11){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 11){
+    return("remission")
+  }
+}
+temp$value <- out
+
+# Chi2 test
+chisq.test(temp$value, temp$variable, correct = F)$p.value
+
+# Table
+table(temp$value, temp$variable)
+```
+
+## SCCAI remission UC patients - Fig4e
+
+```{r fig 4e}
+treatment <- "8 weeks"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="ulcerös kolit"))
+temp_standard <- temp <- groupcat(x1 = data[patients,]$SCCAI,
+              x2 = data[patients,]$SCCAI_3mån,
+              x3 = data[patients,]$SCCAI_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 2){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 2){
+    return("remission")
+  }
+}
+temp$value <- out
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Standard_IV_SCCAI_UC_remission", numeric = F)
+temp <- cbind(variable = rep("Standard_IV_SCCAI_UC_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+treatment <- "4-7"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="ulcerös kolit"))
+temp_optimized <- temp <- groupcat(x1 = data[patients,]$SCCAI,
+              x2 = data[patients,]$SCCAI_3mån,
+              x3 = data[patients,]$SCCAI_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+# No statistical test needed as too few patients
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+out <- foreach(i= c(1:nrow(temp)), .combine = "c")%do% {
+  if(is.na(temp[i,]$value)){
+    return(NA)
+  } else if(as.numeric(as.character(temp[i,]$value)) > 2){
+    return("active disease")
+  } else if(as.numeric(as.character(temp[i,]$value)) <= 2){
+    return("remission")
+  }
+}
+temp$value <- out
+
+# Chi2 test
+chisq.test(temp$value, temp$variable, correct = F)$p.value
+
+# Table
+table(temp$value, temp$variable)
+```
+
+## PRO2 UC remission UC patients - Fig4f
+
+```{r fig 4f}
+treatment <- "8 weeks"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="ulcerös kolit"))
+temp_standard <- temp <- groupcat(x1 = data[patients,]$PRO2_UC,
+              x2 = data[patients,]$PRO2_UC_3mån,
+              x3 = data[patients,]$PRO2_UC_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Standard_IV_PRO2_UC_remission", numeric = F)
+temp <- cbind(variable = rep("Standard_IV_PRO2_UC_remission", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+
+treatment <- "4-7"
+patients <- intersect(which(data$Dose_optimisation == treatment), which(data$Diagnos =="ulcerös kolit"))
+temp_optimized <- temp <- groupcat(x1 = data[patients,]$PRO2_UC,
+              x2 = data[patients,]$PRO2_UC_3mån,
+              x3 = data[patients,]$PRO2_UC_12mån,
+              id = data[patients,]$Studienummer,
+              min_observations_x = 2)
+# No statistical test needed as too few patients
+
+
+temp_standard$variable <- paste("Standard_",temp_standard$variable, sep="")
+temp_optimized$variable <- paste("Optimized_",temp_optimized$variable, sep="")
+temp <- rbind(temp_standard, temp_optimized)
+
+# Chi2 test
+chisq.test(temp$value, temp$variable, correct = F)$p.value
+
+# Table
+table(temp$value, temp$variable)
+```
+
+```{r fig 4 cat save}
+write.table(summary_cat, file ="../Figure 4 statistics/Categorical_stats.txt", sep="\t", row.names = T, col.names = NA)
+temp
+```
+
+
+# ################################################################################
+# # 
+# FIGURE 4 Dose optimisation - plots
+# # 
+# ################################################################################
+
+```{r fig 4 plot}
+# F-calpro
+#######################################################################
+temp <- data[,c("Diagnos","kalprotektin_baseline", "kalprotektin_mån3", "Kalpro_mån12", "Dose_optimisation")]
+colnames(temp) <- c("Group", "Baseline", "3 months", "12 months", "Dose")
+temp <- temp[rowSums(!is.na(temp[2:4]))>=2,] # exclude patients with less than 2 data points
+df <- melt(temp, measure.vars = 2:4)
+temp2 <- paste(df$Group," ", df$variable, " ", df$Dose,sep="")
+temp3 <- unique(temp2)
+temp3 <- temp3[c(seq(3,length(temp3),4),seq(4,length(temp3),4),seq(1,length(temp3),4),seq(2,length(temp3),4))]
+
+temp4 <- paste(df$variable, " ", df$Dose,sep="")
+temp5 <- unique(temp4)
+temp5 <- temp5[c(seq(1,length(temp5),2),seq(2,length(temp5),2))]
+
+df$variable <- factor(as.character(temp2), levels = temp3, ordered = T)
+df$variable2 <- factor(as.character(temp4), levels = temp5, ordered = T)
+df$value <- as.numeric(as.character(df$value))
+
+colors <- c("navyblue","#4F7942","#660000",
+            "#2b58a3","#BFE890","#e7772b",
+            "#2f9da7","#AFE1AF","#e8c124", 
+            "#e92925", "#f49728", "#f6ed31",
+            #"#4B0082","#553c93","#82318f") 
+            "#6C4279","#B990E8","#E1AFE1")
+             
+colors3 <- colors[c(seq(3,9, by = 3), 10:12, seq(1, 9, by = 3), 13:15)]
+#show_col(colors)
+
+p <- ggplot(df, aes(x=variable, y=value, fill = variable)) +
+  geom_boxplot(linewidth = 0.75, colour = "black") +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(values=colors3) +
+  ylab("Calprotectin ug/g (log10)") +
+  xlab(NULL) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/Calprotectin_dose_optimisation_boxplot.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+
+
+colors3 <- colors[c(seq(2,9, by = 3), 13:15)]
+
+p <- ggplot(df, aes(x=variable2, y=value, fill = variable2)) +
+  geom_boxplot(linewidth = 0.75, colour = "black") +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(values=colors3) +
+  ylab("Calprotectin ug/g (log10)") +
+  xlab(NULL) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/Calprotectin_dose_optimisation_boxplot_total.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+kalpro_dose <- p
+
+
+# Calpro remission dose optimisation - sankey
+#######################################################################
+temp <- data[,c("Diagnos","kalprotektin_baseline", "kalprotektin_mån3", "Kalpro_mån12", "Dose_optimisation")]
+colnames(temp) <- c("Group", "Baseline", "3 months", "12 months", "Dose")
+temp <- temp[rowSums(!is.na(temp[2:4]))>=2,] # exclude patients with less than 2 data points
+out <- foreach(i= c(2:4), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[as.numeric(as.character(temp[,i])) < 150] <- "remission"
+  temp2[as.numeric(as.character(temp[,i])) >= 150] <- "active disease"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- cbind(temp[,c(1,5)],out)
+colnames(temp) <- c("Diagnos", "Dose", "Baseline", "3 months", "12 months")
+
+# CD - normal
+df <- temp[intersect(which(temp[,1] == "crohns sjukdom"), which(temp[,2] == "8 weeks")),] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$x2 <- paste("CD_normal_", as.character(lodes$x), sep="")
+lodes$x <- paste("Normal_", as.character(lodes$x), sep="")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n2 <- 100* as.numeric(lodes$n) / length(intersect(which(temp[,1] == "crohns sjukdom"), which(temp[,2] == "8 weeks")))
+lodes$n <- 100* as.numeric(lodes$n) / sum(temp[,2] == "8 weeks")
+
+# CD - optimised
+df2 <- temp[intersect(which(temp[,1] == "crohns sjukdom"), which(temp[,2] == "4-7")),] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x2 <- paste("CD_optimised_", as.character(lodes2$x), sep="")
+lodes2$x <- paste("Optimised_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n2 <- 100* as.numeric(lodes2$n) / length(intersect(which(temp[,1] == "crohns sjukdom"), which(temp[,2] == "4-7")))
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,2] == "4-7")
+
+# UC - normal
+df3 <- temp[intersect(which(temp[,1] == "ulcerös kolit"), which(temp[,2] == "8 weeks")),] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes3 <- to_lodes_form(df3, axes = 1:3, id = "Cohort")
+lodes3$Cohort <- lodes3$Cohort + max(lodes2$Cohort)
+lodes3$x2 <- paste("UC_normal_", as.character(lodes3$x), sep="")
+lodes3$x <- paste("Normal_", as.character(lodes3$x), sep="")
+lodes3$stratum <- factor(x = as.character(lodes3$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes3$n2 <- 100* as.numeric(lodes3$n) / length(intersect(which(temp[,1] == "ulcerös kolit"), which(temp[,2] == "8 weeks")))
+lodes3$n <- 100* as.numeric(lodes3$n) / sum(temp[,2] == "8 weeks")
+
+# UC - optimised
+df4 <- temp[intersect(which(temp[,1] == "ulcerös kolit"), which(temp[,2] == "4-7")),] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes4 <- to_lodes_form(df4, axes = 1:3, id = "Cohort")
+lodes4$Cohort <- lodes4$Cohort + max(lodes3$Cohort)
+lodes4$x2 <- paste("UC_optimised_", as.character(lodes4$x), sep="")
+lodes4$x <- paste("Optimised_", as.character(lodes4$x), sep="")
+lodes4$stratum <- factor(x = as.character(lodes4$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes4$n2 <- 100* as.numeric(lodes4$n) / length(intersect(which(temp[,1] == "ulcerös kolit"), which(temp[,2] == "4-7")))
+lodes4$n <- 100* as.numeric(lodes4$n) / sum(temp[,2] == "4-7")
+
+lodes <- rbind(lodes, lodes2, lodes3, lodes4)
+lodes$x2 <- factor(as.character(lodes$x2), levels = as.character(unique(lodes$x2)),ordered = T)
+lodes$x <- factor(as.character(lodes$x), levels = as.character(unique(lodes$x)),ordered = T)
+
+p <- ggplot(lodes, aes(x = x2, stratum = stratum, alluvium = Cohort, y = n2, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [<150 ug/g] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/Calpro_remission_dose_optimisation_sankey.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [<150 ug/g] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/Calpro_remission_dose_optimisation_sankey_combined.pdf",plot = p, device = "pdf", width = 20, height = 12, units = "cm")
+kalpro_remission_dose <- p
+
+# HBI remission - sankey
+#######################################################################
+
+temp <- data[data$Diagnos == "crohns sjukdom",c("HBI_baseline", "HBI_3mån", "HBI_12mån", "Dose_optimisation")]
+temp <- temp[rowSums(!is.na(temp[1:3]))>=2,] # exclude patients with less than 2 data points
+out <- foreach(i= c(1:3), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[as.numeric(temp[,i]) <= 4] <- "remission"
+  temp2[as.numeric(temp[,i]) > 4] <- "active disease"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- cbind(out, as.character(temp[,4]))
+colnames(temp) <- c("Baseline", "3 months", "12 months", "Dose")
+temp <- as.data.frame(temp)
+
+# CD - normal
+df <- temp[temp[,4] == "8 weeks",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$x <- paste("Normal_", as.character(lodes$x), sep="")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / sum(temp[,4] == "8 weeks")
+
+# CD - optimised
+df2 <- temp[temp[,4] == "4-7",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x <- paste("Optimised_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,4] == "4-7")
+
+lodes <- rbind(lodes, lodes2)
+lodes$x <- factor(as.character(lodes$x), levels = as.character(unique(lodes$x)),ordered = T)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [pHBI <= 4] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/HBI_remission_sankey_CD_dose_optimisation.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+HBI_remission_optimised <- p
+
+
+# PRO2 CD remission - sankey
+#######################################################################
+
+temp <- data[data$Diagnos == "crohns sjukdom",c("PRO2_CD_Baseline", "PRO2_CD_3mån", "PRO2_CD_12mån","Dose_optimisation")]
+temp <- temp[rowSums(!is.na(temp[1:3]))>=2,] # exclude patients with less than 2 data points
+out <- foreach(i= c(1:3), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[as.numeric(as.character(temp[,i])) <= 11] <- "remission"
+  temp2[as.numeric(as.character(temp[,i])) > 11] <- "active disease"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- cbind(out, as.character(temp[,4]))
+colnames(temp) <- c("Baseline", "3 months", "12 months", "Dose")
+temp <- as.data.frame(temp)
+
+# CD - normal
+df <- temp[temp[,4] == "8 weeks",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$x <- paste("Normal_", as.character(lodes$x), sep="")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / sum(temp[,4] == "8 weeks")
+
+# CD - optimised
+df2 <- temp[temp[,4] == "4-7",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x <- paste("Optimised_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,4] == "4-7")
+
+lodes <- rbind(lodes, lodes2)
+lodes$x <- factor(as.character(lodes$x), levels = as.character(unique(lodes$x)),ordered = T)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [PRO2-CD<=11] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/PRO2_CD_remission_sankey_dose_optimisation.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+PRO2CD_remission_optimised <- p
+
+# SCCAI UC remission - sankey
+#######################################################################
+
+temp <- data[data$Diagnos == "ulcerös kolit",c("SCCAI", "SCCAI_3mån", "SCCAI_12mån", "Dose_optimisation")]
+temp <- temp[rowSums(!is.na(temp[1:3]))>=2,] # exclude patients with less than 2 data points
+out <- foreach(i= c(1:3), .combine = "cbind")%do% {
+  temp2 <- vector()
+  temp2[as.numeric(as.character(temp[,i])) <= 2] <- "remission"
+  temp2[as.numeric(as.character(temp[,i])) > 2] <- "active disease"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- cbind(out, as.character(temp[,4]))
+colnames(temp) <- c("Baseline", "3 months", "12 months", "Dose")
+temp <- as.data.frame(temp)
+
+# UC - normal
+df <- temp[temp[,4] == "8 weeks",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$x <- paste("Normal_", as.character(lodes$x), sep="")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / sum(temp[,4] == "8 weeks")
+
+# UC - optimised
+df2 <- temp[temp[,4] == "4-7",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x <- paste("Optimised_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,4] == "4-7")
+
+lodes <- rbind(lodes, lodes2)
+lodes$x <- factor(as.character(lodes$x), levels = as.character(unique(lodes$x)),ordered = T)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [SCCAI <= 2] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/SCCAI_UC_remission_sankey_dose_optimisation.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+SCCAI_remission_optimised <- p
+
+# PRO2 UC remission - sankey
+#######################################################################
+
+temp <- data[data$Diagnos == "ulcerös kolit",c("PRO2_UC", "PRO2_UC_3mån", "PRO2_UC_12mån", "Dose_optimisation")]
+temp <- temp[rowSums(!is.na(temp[1:3]))>=2,] # exclude patients with less than 2 data points
+out <- foreach(i= c(1:3), .combine = "cbind") %do% {
+  temp2 <- vector()
+  temp2[as.character(temp[,i]) == "remission"] <- "remission"
+  temp2[as.character(temp[,i]) == "aktiv sjukdom"] <- "active disease"
+  temp2[is.na(temp[,i])] <- "Missing"
+  return(temp2)
+}
+temp <- cbind(out, as.character(temp[,4]))
+colnames(temp) <- c("Baseline", "3 months", "12 months", "Dose")
+temp <- as.data.frame(temp)
+
+# UC - normal
+df <- temp[temp[,4] == "8 weeks",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes <- to_lodes_form(df, axes = 1:3, id = "Cohort")
+lodes$x <- paste("Normal_", as.character(lodes$x), sep="")
+lodes$stratum <- factor(x = as.character(lodes$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes$n <- 100* as.numeric(lodes$n) / sum(temp[,4] == "8 weeks")
+
+# UC - optimised
+df2 <- temp[temp[,4] == "4-7",] %>% dplyr::count(Baseline, `3 months`, `12 months`)
+lodes2 <- to_lodes_form(df2, axes = 1:3, id = "Cohort")
+lodes2$Cohort <- lodes2$Cohort + max(lodes$Cohort)
+lodes2$x <- paste("Optimised_", as.character(lodes2$x), sep="")
+lodes2$stratum <- factor(x = as.character(lodes2$stratum), levels = c("active disease", "Missing", "remission"), ordered = T)
+lodes2$n <- 100* as.numeric(lodes2$n) / sum(temp[,4] == "4-7")
+
+lodes <- rbind(lodes, lodes2)
+lodes$x <- factor(as.character(lodes$x), levels = as.character(unique(lodes$x)),ordered = T)
+
+p <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = Cohort, y = n, color = stratum, fill = stratum, label = stratum)) +
+  geom_flow() +
+  geom_stratum(alpha = 1, linewidth = 0.75, color = "black") +
+  scale_y_continuous(breaks = seq(0,100,25), labels = c(0,25,50,75,"  100")) +
+  ylab("Remission [PRO2-UC = 0] (%)") +
+  xlab(NULL) +
+  scale_color_manual(values = color2) +
+  scale_fill_manual(values = color2) +
+  theme(plot.title = element_text(hjust = .5),
+        axis.line = element_line(colour = "black", linewidth = 1.5),
+        axis.ticks = element_line(color = "black", linewidth = 1.5),
+        axis.ticks.length = unit(x = 2.5, units = "mm"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.text = element_text(colour = "black", ),
+        axis.title.y = element_text(color = "black", , face = "bold"),
+        plot.background = element_blank(), 
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.margin = unit(c(1.5,0.5,0,0), "cm"))
+
+ggsave(filename = "../Figure 4 plots/PRO2_UC_remission_sankey_dose_optimisation.pdf",plot = p, device = "pdf", width = 12, height = 10, units = "cm")
+PRO2UC_remission_optimised <- p
+
+
+# COMBINATION
+#######################################################################
+p <- ggarrange(kalpro_dose + theme(legend.position = "none"), 
+               kalpro_remission_dose + theme(legend.position = "none"), 
+               HBI_remission_optimised + theme(legend.position = "none"), 
+               PRO2CD_remission_optimised + theme(legend.position = "none"), 
+               SCCAI_remission_optimised + theme(legend.position = "none"), 
+               PRO2UC_remission_optimised + theme(legend.position = "none"), 
+               labels = paste(letters[1:6], ")",sep=""), 
+               ncol = 2, nrow = 3)
+ggsave(filename = "../Figure 4 plots/FIGURE4_unedited_all_labels.pdf",plot = p, device = "pdf", width = 17.5, height = 35, units = "cm")
+
+
+p <- ggarrange(kalpro_dose + theme(legend.position = "none", axis.text.x = element_blank()), 
+               kalpro_remission_dose + theme(legend.position = "none", axis.text.x = element_blank()), 
+               HBI_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               PRO2CD_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               SCCAI_remission_optimised + theme(legend.position = "none"), 
+               PRO2UC_remission_optimised + theme(legend.position = "none"), 
+               labels = paste(letters[1:6], ")",sep=""), 
+               ncol = 2, nrow = 3)
+ggsave(filename = "../Figure 4 plots/FIGURE4_unedited.pdf",plot = p, device = "pdf", width = 17.5, height = 30, units = "cm")
+
+p <- ggarrange(kalpro_dose + theme(legend.position = "none", axis.text.x = element_blank()), 
+               kalpro_remission_dose + theme(legend.position = "none", axis.text.x = element_blank()), 
+               HBI_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               PRO2CD_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               SCCAI_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               PRO2UC_remission_optimised + theme(legend.position = "none", axis.text.x = element_blank()), 
+               labels = paste(letters[1:6], ")",sep=""), 
+               ncol = 2, nrow = 3)
+ggsave(filename = "../Figure 4 plots/FIGURE4_unedited_equal_plot_sizes_no_labels.pdf",plot = p, device = "pdf", width = 17.5, height = 25, units = "cm")
+```
+
+
+# ################################################################################
+# # 
+# FIGURE 5 Calprotectin vs Vedolizumab concentration - plots
+# # 
+# ################################################################################
+
+```{r fig 5}
+dir.create("../Figure 5 statistics/")
+dir.create("../Figure 5 plots/")
+```
+
+```{r fig 5 plot}
+data$kalprotektin_baseline <- as.numeric(as.character(data$kalprotektin_baseline))
+data$kalprotektin_mån3 <- as.numeric(as.character(data$kalprotektin_mån3))
+data$Kalpro_mån12 <- as.numeric(as.character(data$Kalpro_mån12))
+temp <- data[,c("Studienummer", "Diagnos","kalprotektin_baseline", "kalprotektin_mån3", "Kalpro_mån12")]
+colnames(temp) <- c("Patient", "Group", "Baseline", "3 months", "12 months")
+
+data$Vedolizumab_baseline <- as.numeric(as.character(data$Vedolizumab_baseline))
+data$Vedolizumab_mån3 <- as.numeric(as.character(data$Vedolizumab_mån3))
+data$Vedolizumab_mån12 <- as.numeric(as.character(data$Vedolizumab_mån12))
+temp2 <-   data[,c("Studienummer", "Diagnos","Vedolizumab_baseline", "Vedolizumab_mån3", "Vedolizumab_mån12")]
+colnames(temp2) <- c("Patient", "Group", "Baseline", "3 months", "12 months")
+
+df <- melt(temp, measure.vars = 3:5)
+df <- cbind(df, match = paste(df[,1],"_", df[,2],"_", df[,3], sep=""))
+df2 <- melt(temp2, measure.vars = 3:5)
+df2 <- cbind(df2, match = paste(df2[,1],"_", df2[,2],"_", df2[,3], sep=""))
+df <- cbind(df[,-5], df2[match(df$match, df2$match),]$value)
+colnames(df) <- c(colnames(df)[1:3], "Calprotectin", "Vedolizumab_concentration")
+
+df$Calprotectin <- as.numeric(as.character(df$Calprotectin))
+df$Vedolizumab_concentration <- as.numeric(as.character(df$Vedolizumab_concentration))
+df$variable <- factor(as.character(df$variable), levels = c("Baseline", "3 months", "12 months"), ordered = T)
+df$Group <- factor(as.character(df$Group), levels = c("crohns sjukdom", "ulcerös kolit"), ordered = T)
+rm(temp, temp2, df2)
+
+temp <- paste(df$Group, "__",df$variable,sep="")
+colors3 <- colors[c(seq(2, 9, by = 3), seq(3,9, by = 3), seq(1, 9, by = 3))]
+colors3 <- colors3[-c(1:3)]
+df$Group2 <- factor(as.character(temp), levels = unique(temp)[c(2,4,6,1,3,5)], ordered = T)
+names(colors3) <- levels(df$Group2)
+
+p <- ggplot(df, aes(x=Vedolizumab_concentration, y=Calprotectin, colour = Group2)) + 
+  geom_point() +
+  scale_color_manual(values = colors3) +
+  scale_y_continuous(trans = "log10") +
+  facet_grid(Group ~ variable, margins = T) +
+  theme(plot.title = element_text(hjust = .5),
+         axis.line = element_line(colour = "black", linewidth = 1),
+         axis.ticks = element_line(color = "black", linewidth = 1),
+         axis.ticks.length = unit(x = 2.5, units = "mm"),
+         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+         axis.text = element_text(colour = "black", size = 10),
+         axis.title.y = element_text(color = "black", size = 10, face = "bold"),
+         plot.background = element_blank(), 
+         #panel.background = element_blank(),
+         #panel.grid = element_blank(),
+         plot.margin = unit(c(1,1,0,1), "cm"))
+
+ggsave(filename = "../Figure 5 plots/FIGURE5_unedited.pdf",plot = p, device = "pdf", width = 22, height = 16, units = "cm")
+plot(p)
+```
+
+
+
+

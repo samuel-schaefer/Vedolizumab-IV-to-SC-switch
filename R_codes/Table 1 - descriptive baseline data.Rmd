@@ -1,0 +1,517 @@
+---
+title: "Table 1 - descriptive baseline data"
+author: "Samuel Schäfer"
+date: "2024-01-29"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE, echo = F}
+knitr::opts_chunk$set(collapse = TRUE, echo = T, comment = "#>")
+
+library(memisc)
+library(dplyr)
+library(readxl)
+library(foreach)
+library(ggpubr)
+library(summarytools)
+library(pastecs)
+library(plyr)
+library(reshape2)
+
+dir.create(path = "../Descriptive_stats", showWarnings = F)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# SPSS data
+
+```{r}
+# Load SPSS data set
+dataset <- as.data.set(spss.system.file("../Input/DataSet4 UCCD.sav Dec 27 2023.sav", ))
+dataset <- deduplicate_labels(dataset, method = "prefix")
+
+data <- as.data.frame(dataset)
+data <- data[data$Diagnos != "obestämbar kolit",]
+data$Vedolizumab_baseline <- as.numeric(gsub(pattern = ",", replacement = ".",  x = as.character(data$Vedolizumab_baseline), fixed = T))
+
+treatment <- readxl::read_xlsx(path = "../Input/Månader på iv vedo behandling.xlsx")
+treatment <- as.matrix(treatment)
+treatment[treatment[,2] == "N/A",2] <- NA
+switch <- readxl::read_xlsx(path = "../Input/byte av behandling efter byte.xlsx")
+data <- cbind(data, treatment[match(as.character(data$Studienummer),as.character(treatment[,1])),])
+```
+
+# General function
+
+```{r}
+stats <- function(group, values, name, numeric = T) {
+  if(numeric){
+    values <- as.numeric(as.character(values))
+    df <- data.frame(values = values, group = as.character(group))
+    df$group <- factor(group, levels = unique(group))
+    
+    #Density
+    p <- ggdensity(data = df, x = "values", add = "mean", color = "group", fill = "group") + 
+      geom_density()
+    ggsave(filename = paste(name, "_density_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Q-Q plot
+    p <- ggqqplot(data = df, x = "values", add = "mean", color = "group", fill = "group")
+    ggsave(filename = paste(name, "_Q-Q_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Histogram
+    mu <- ddply(df, "group", summarise, grp.mean=mean(values))
+    p <- ggplot(data = df, aes(x = values, color = group, fill = group)) + 
+      geom_histogram(position = "identity", alpha = 0.5) +
+      geom_vline(data = mu, aes(xintercept = grp.mean, color = group), linetype = "dashed")
+    ggsave(filename = paste(name, "_histogram.pdf",sep=""), plot = p, device = "pdf")
+    
+    if(length(unique(group))>1){
+      # Shapiro-Wilk normality test
+      shapiro <- aggregate(df$values, by = list(df$group), FUN = function(x) {shapiro.test(x)$p.value})
+      shapiro <- cbind(Group = as.character(shapiro[[1]]), shapiro[[2]])
+      # T-test
+      ttest <- rbind(t.test(df$values ~ df$group)$p.value, NA)
+      # Wilcoxon sign rank test
+      wilcoxon <- rbind(wilcox.test(df$values ~ df$group, exact = F)$p.value, NA)
+    } else {
+      ttest <- wilcoxon <- NA
+      shapiro <- matrix(NA, ncol = 2, nrow = 1)
+    }
+    # summary
+    summary <- as.data.frame(aggregate(df$values, by = list(df$group), FUN = function(x) {stat.desc(x)}))
+    summary <- cbind(Group = as.character(summary[[1]]), summary[[2]])
+    
+    q1 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,1/4, na.rm = T)}))[[2]]
+    q3 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,3/4, na.rm = T)}))[[2]]
+    
+    out <- cbind(summary, Q1=q1, Q3=q3, shapiro_pval = shapiro[,-1], t_test_pval = as.vector(ttest), wilcoxon_sign_rank_pval = as.vector(wilcoxon))
+    return(out)
+  } else {
+    group <- factor(group, levels = unique(group))
+    ctable <- table(values, group)
+    ctable_perc <- 100*t(t(ctable)/colSums(ctable))
+    ctable_perc <- round(ctable_perc,1)
+    
+    df <- melt(ctable_perc)
+    p <- ggplot(data = df, aes(x = group, y = value, fill = values)) + 
+      geom_bar(stat = "identity") + 
+      ylab("Proportion (%)") +
+      xlab(NULL) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    ggsave(filename = paste(name, "_stacked_bar_plot.pdf",sep=""), plot = p, device = "pdf")
+    
+    fisher <- fisher.test(ctable)$p
+    chi2 <- chisq.test(values, group, correct = F)$p.value
+    
+    out <- cbind(ctable[,1], ctable_perc[,1], ctable[,2], ctable_perc[,2], 
+                 c(fisher, rep(NA, times = nrow(ctable)-1)), 
+                 c(chi2, rep(NA, times = nrow(ctable)-1)))
+    colnames(out) <- c(colnames(ctable)[1],paste(colnames(ctable)[1], "_%",sep=""), 
+                       colnames(ctable)[2],paste(colnames(ctable)[2], "_%",sep=""), 
+                       "Fisher_exact_P", "Chi2_P")
+    return(out)
+  }
+}
+
+```
+
+# Numerical variables
+
+## Age at baseline
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Ålder_baseline, name = "../Descriptive_stats/age_baseline", numeric = T)
+temp <- cbind(variable = rep("age_baseline", times = nrow(temp)), temp)
+summary <- temp
+temp
+```
+
+## Age at diagnosis
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Ålder_vid_diagnos, name = "../Descriptive_stats/age_diagnosis", numeric = T)
+temp <- cbind(variable = rep("age_diagnosis", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+## Disease duration
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Sjukdomsduration_baseline, name = "../Descriptive_stats/disease_duration_baseline", numeric = T)
+temp <- cbind(variable = rep("disease_duration_baseline", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+## Height
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Längd_baseline, name = "../Descriptive_stats/height", numeric = T)
+temp <- cbind(variable = rep("height", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Height - female
+```{r}
+temp <- stats(group = data[data$Kön == "kvinna",]$Diagnos,
+              values = data[data$Kön == "kvinna",]$Längd_baseline,
+              name = "../Descriptive_stats/height_female", numeric = T)
+temp <- cbind(variable = rep("height_female", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Height - male
+```{r}
+temp <- stats(group = data[data$Kön == "man",]$Diagnos,
+              values = data[data$Kön == "man",]$Längd_baseline,
+              name = "../Descriptive_stats/height_male", numeric = T)
+temp <- cbind(variable = rep("height_male", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Weight
+```{r}
+temp <- stats(group = data$Diagnos, values = data$vikt_baseline, name = "../Descriptive_stats/weight", numeric = T)
+temp <- cbind(variable = rep("weight", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Weight - female
+```{r}
+temp <- stats(group = data[data$Kön == "kvinna",]$Diagnos,
+              values = data[data$Kön == "kvinna",]$vikt_baseline,
+              name = "../Descriptive_stats/weight_female", numeric = T)
+temp <- cbind(variable = rep("weight_female", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Weight - male
+```{r}
+temp <- stats(group = data[data$Kön == "man",]$Diagnos,
+              values = data[data$Kön == "man",]$vikt_baseline,
+              name = "../Descriptive_stats/weight_male", numeric = T)
+temp <- cbind(variable = rep("weight_male", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## BMI
+```{r}
+temp <- stats(group = data$Diagnos, values = data$BMI_baseline,name = "../Descriptive_stats/bmi", numeric = T)
+temp <- cbind(variable = rep("bmi", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Calprotektin baseline
+```{r}
+temp <- stats(group = data$Diagnos, values = data$kalprotektin_baseline, name = "../Descriptive_stats/calpro_baseline", numeric = T)
+temp <- cbind(variable = rep("calpro_baseline", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## CRP baseline
+```{r}
+temp <- stats(group = data$Diagnos, values = data$CRP_baseline, name = "../Descriptive_stats/CRP_baseline", numeric = T)
+temp <- cbind(variable = rep("CRP_baseline", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## Vedolizumab baseline
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Vedolizumab_baseline, name = "../Descriptive_stats/Vedolizumab_baseline", numeric = T)
+temp <- cbind(variable = rep("Vedolizumab_baseline", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+## Albumin
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Alb_baseline, name = "../Descriptive_stats/albumin", numeric = T)
+temp <- cbind(variable = rep("albumin", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+## Patient Based Harvey Bradshaw Index - HBI
+```{r}
+temp <- stats(group = data[data$Diagnos == "crohns sjukdom",]$Diagnos, values = data[data$Diagnos == "crohns sjukdom",]$HBI_baseline, name = "../Descriptive_stats/hbi", numeric = T)
+temp <- cbind(variable = rep("hbi", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## PRO2 - CD
+```{r}
+temp <- stats(group = data[data$Diagnos == "crohns sjukdom",]$Diagnos, values = data[data$Diagnos == "crohns sjukdom",]$PRO2_CD_Baseline, name = "../Descriptive_stats/PRO2_CD", numeric = T)
+temp <- cbind(variable = rep("PRO2_CD", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## SCCAI
+```{r}
+temp <- stats(group = data[data$Diagnos == "ulcerös kolit",]$Diagnos, values = data[data$Diagnos == "ulcerös kolit",]$SCCAI, name = "../Descriptive_stats/SCCAI", numeric = T)
+temp <- cbind(variable = rep("SCCAI", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## PRO2 - UC
+```{r}
+temp <- stats(group = data[data$Diagnos == "ulcerös kolit",]$Diagnos, values = data[data$Diagnos == "ulcerös kolit",]$PRO, name = "../Descriptive_stats/PRO2_UC", numeric = T)
+temp <- cbind(variable = rep("PRO2_UC", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## SHS composite score
+
+Not found! 
+
+```{r}
+# temp <- stats(group = data$Diagnos, values = data$, name = "../Descriptive_stats/SHS_funktion", numeric = T)
+# temp <- cbind(variable = rep("SHS_funktion", times = nrow(temp)), temp)
+# summary <- rbind(summary, temp)
+# temp
+```
+
+## Time on iv Vedolizumab 
+```{r}
+temp <- stats(group = data$Diagnos, values = data$`månader på iv vedolizumab vid baseline`, name = "../Descriptive_stats/Time_iv_vedolizumab", numeric = T)
+temp <- cbind(variable = rep("Time_iv_vedolizumab", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
+
+## SAVE Outcomes
+```{r}
+write.table(summary, file = "../Descriptive_stats/Table_1_numerical_data.txt", sep="\t", row.names = T, col.names = NA)
+```
+
+
+# Categorical variables
+
+## Age at diagnosis
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Ålder_diagnos, name = "../Descriptive_stats/Age_category", numeric = F)
+temp <- cbind(variable = rep("Age_categorical", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+```
+
+## Gender
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Kön, name = "../Descriptive_stats/Gender", numeric = F)
+temp <- cbind(variable = rep("Gender", times = nrow(temp)), temp)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## Smoking
+```{r}
+temp <- stats(group = data$Diagnos, values = data$Rökning, name = "../Descriptive_stats/Smoking", numeric = F)
+temp <- cbind(variable = rep("Smoking", times = nrow(temp)), temp)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## UC disease location
+```{r}
+temp <- table(data[data$Diagnos == "ulcerös kolit",]$Utbredning_UC)
+temp2 <- matrix(NA, ncol = ncol(summary_cat)-1, nrow = length(temp))
+colnames(temp2) <- colnames(summary_cat)[-1]
+temp2[,1] <- temp
+temp2[,2] <- round(100*temp / sum(temp),1)
+rownames(temp2) <- names(temp)
+temp <- cbind(variable = rep("UC_location", times = nrow(temp)), temp2)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## CD disease location
+```{r}
+temp <- table(data[data$Diagnos == "crohns sjukdom",]$Disease_location_CD)
+temp2 <- matrix(NA, ncol = ncol(summary_cat)-1, nrow = length(temp))
+colnames(temp2) <- colnames(summary_cat)[-1]
+temp2[,3] <- temp
+temp2[,4] <- round(100*temp / sum(temp),1)
+rownames(temp2) <- names(temp)
+temp <- cbind(variable = rep("CD_location", times = nrow(temp)), temp2)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## CD disease behavior
+```{r}
+temp <- table(data[data$Diagnos == "crohns sjukdom",]$Disease_behaviour_CD)
+temp2 <- matrix(NA, ncol = ncol(summary_cat)-1, nrow = length(temp))
+colnames(temp2) <- colnames(summary_cat)[-1]
+temp2[,3] <- temp
+temp2[,4] <- round(100*temp / sum(temp),1)
+rownames(temp2) <- names(temp)
+temp <- cbind(variable = rep("CD_behaviour", times = nrow(temp)), temp2)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## Disease activity (PRO2)
+
+Not sure if I found the correct one! Is this the correct variable? Are the values in this variable correct?
+
+```{r}
+temp <- stats(group = data$Diagnos, values = data$PRO2CD_UC, name = "../Descriptive_stats/Disease_activity_PRO2", numeric = F)
+temp <- cbind(variable = rep("Disease_activity_PRO2", times = nrow(temp)), temp)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## IBD treatment at baseline
+```{r}
+temp <- stats(group = data$Diagnos, values = data$LKM_baseline, name = "../Descriptive_stats/Treatment_baseline", numeric = F)
+temp <- cbind(variable = rep("Treatment_baseline", times = nrow(temp)), temp)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## Topical treatment
+
+Not found...!!
+
+## Vedolizumab infusion interval
+```{r}
+temp <- stats(group = data$Diagnos, values = data$IV_Vedo_interval, name = "../Descriptive_stats/Vedolizumab_iv_dose_interval", numeric = F)
+temp <- cbind(variable = rep("Vedolizumab_iv_dose_interval", times = nrow(temp)), temp)
+summary_cat <- rbind(summary_cat,temp)
+temp
+```
+
+## SAVE Outcomes
+```{r}
+write.table(summary_cat, file = "../Descriptive_stats/Table_1_categorical_data.txt", sep="\t", row.names = T, col.names = NA)
+```
+
+
+# Numbers for "all patients"
+
+## Age
+```{r}
+print("Age baseline")
+x <- as.numeric(as.character(data$Ålder_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+
+print("Age diagnosis")
+x <- as.numeric(as.character(data$Ålder_vid_diagnos))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## Height
+```{r}
+print("Height all")
+x <- as.numeric(as.character(data$Längd_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+
+print("Height female")
+x <- as.numeric(as.character(data[data$Kön == "kvinna",]$Längd_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+
+print("Height male")
+x <- as.numeric(as.character(data[data$Kön == "man",]$Längd_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## Weight
+```{r}
+print("Weight all")
+x <- as.numeric(as.character(data$vikt_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+
+print("Weight female")
+x <- as.numeric(as.character(data[data$Kön == "kvinna",]$vikt_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+
+print("Weight male")
+x <- as.numeric(as.character(data[data$Kön == "man",]$vikt_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## BMI
+```{r}
+print("BMI all")
+x <- as.numeric(as.character(data$BMI_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+## Calpro
+```{r}
+print("Calpro all")
+x <- as.numeric(as.character(data$kalprotektin_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## CRP
+```{r}
+print("CRP all")
+x <- as.numeric(as.character(data$CRP_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## Vedolizumab
+```{r}
+print("Vedolizumab all")
+x <- as.numeric(as.character(data$Vedolizumab_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## Albumin
+```{r}
+print("Albumin all")
+x <- as.numeric(as.character(data$Alb_baseline))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+
+## PRO2 UC
+```{r}
+print("PRO2 UC")
+x <- as.numeric(as.character(data[data$Diagnos == "ulcerös kolit",]$pro))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
+
+## Time on vedo
+```{r}
+print("Vedo time")
+x <- as.numeric(as.character(data$Tid_IV_Vedo))
+stat.desc(x)
+quantile(x,1/4, na.rm = T)
+quantile(x,3/4, na.rm = T)
+```
