@@ -1,0 +1,363 @@
+---
+title: "Table 2 - timepoint data"
+author: "Samuel Schäfer"
+date: "2024-02-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo = F}
+knitr::opts_chunk$set(collapse = TRUE, echo = T, comment = "#>")
+
+library(memisc)
+library(dplyr)
+library(readxl)
+library(summarytools)
+library(pastecs)
+library(plyr)
+library(reshape2)
+library(rstatix)
+library(doParallel)
+library(Partiallyoverlapping)
+library(rcompanion)
+library(ggpubr)
+
+dir.create(path = "../Descriptive_stats_table2", showWarnings = F)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# SPSS data
+
+```{r}
+# Load SPSS data set
+dataset <- as.data.set(spss.system.file("../Input/DataSet4 UCCD.sav Dec 27 2023.sav", ))
+dataset <- deduplicate_labels(dataset, method = "prefix")
+
+data <- as.data.frame(dataset)
+data <- data[data$Diagnos != "obestämbar kolit",]
+data$Vedolizumab_baseline <- as.numeric(gsub(pattern = ",", replacement = ".",  x = as.character(data$Vedolizumab_baseline), fixed = T))
+
+treatment <- readxl::read_xlsx(path = "../Input/Månader på iv vedo behandling.xlsx")
+treatment <- as.matrix(treatment)
+treatment[treatment[,2] == "N/A",2] <- NA
+switch <- readxl::read_xlsx(path = "../Input/byte av behandling efter byte.xlsx")
+data <- cbind(data, treatment[match(as.character(data$Studienummer),as.character(treatment[,1])),])
+
+data[duplicated(data$Studieid),]$Studieid <- paste(data[duplicated(data$Studieid),]$Studieid, "_2",sep="")
+data$Studienummer <- factor(data$Studieid, levels = unique(data$Studieid))
+```
+
+# General function
+
+For numeric data a ANOVA for normally distributed data and Friedmans's test for non-parametric data.
+If significant, post-hoc tests will be calculated by paired t-test and partially paired t-testor a paired Wilcoxon sign rank test.
+
+For categorical data, chi-square will be calculated. post-hoc tests will be calculated by McNemars test (given that this is paired data). 
+
+
+```{r}
+stats <- function(group, values, id, name, numeric = T) {
+  
+  if(numeric){
+    values <- as.numeric(as.character(values))
+    df <- data.frame(values = values, group = as.character(group))
+    df$group <- factor(group, levels = unique(group))
+    df$id <- factor(as.character(id), levels = unique(id))
+    
+    #Density
+    p <- ggdensity(data = df, x = "values", add = "mean", color = "group", fill = "group") + 
+      geom_density()
+    ggsave(filename = paste(name, "_time_point_density_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Q-Q plot
+    p <- ggqqplot(data = df, x = "values", add = "mean", color = "group", fill = "group")
+    ggsave(filename = paste(name, "_time_point_Q-Q_plot.pdf",sep=""), plot = p, device = "pdf")
+    # Histogram
+    mu <- ddply(df, "group", summarise, grp.mean=mean(values))
+    p <- ggplot(data = df, aes(x = values, color = group, fill = group)) + 
+      geom_histogram(position = "identity", alpha = 0.5) +
+      geom_vline(data = mu, aes(xintercept = grp.mean, color = group), linetype = "dashed")
+    ggsave(filename = paste(name, "_time_point_histogram.pdf",sep=""), plot = p, device = "pdf")
+    
+    if(length(unique(group))>2){
+      # Shapiro-Wilk normality test
+      shapiro <- aggregate(df$values, by = list(df$group), FUN = function(x) {shapiro.test(x)$p.value})
+      shapiro <- cbind(Group = as.character(shapiro[[1]]), shapiro[[2]])
+      
+      # PARAMETRIC
+      # ANOVA 
+      anova <- anova_test(data = df, dv = values, wid = id, within = group)$ANOVA$p
+      
+      # Paired T-test
+      ttest <- unlist(pairwise.t.test(x = df$values, g = df$group, paired = T, na.action = "na.omit", p.adjust.method="bonferroni"))[3:4]
+      
+      # Partially overlapping t-test (paired and unpaired observations)
+      df2 <- dcast(df,  id ~ group, value.var= "values") 
+      partover <- foreach(i = c(3:4), .combine = "c") %do% {
+        temp <- Partover.test(
+                                x1 = df2[intersect(which(!is.na(df2[,2])), which(is.na(df2[,i]))),2], # unpaired values sample 1
+                                x2 = df2[intersect(which(is.na(df2[,2])), which(!is.na(df2[,i]))),i], # unpaired values sample 2
+                                x3 = df2[intersect(which(!is.na(df2[,2])), which(!is.na(df2[,i]))),2], # paired values sample 1
+                                x4 = df2[intersect(which(!is.na(df2[,2])), which(!is.na(df2[,i]))),i], # paired values sample 2
+                                var.equal = T
+                              )
+        return(temp$p.value)
+      }
+      
+      # NONPARAMETRIC
+      # Friedmans test
+      friedman <- friedman.test(blocks=df$id, groups=df$group, y=df$values)$p.value
+      
+      # Paired Wilcoxon sign rank test
+      wilcoxon <- unlist(pairwise.wilcox.test(df$values, df$group, exact = F, p.adjust.method = "bonferroni", paired = T))[3:4]
+      
+    } else {
+      partover <- ttest <- wilcoxon <- c(NA, NA)
+      anova <- friedman <- NA
+      shapiro <- matrix(NA, ncol = 1, nrow = 3)
+    }
+    
+    # summary
+    summary <- as.data.frame(aggregate(df$values, by = list(df$group), FUN = function(x) {stat.desc(x)}))
+    summary <- cbind(Group = as.character(summary[[1]]), summary[[2]])
+    
+    q1 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,1/4, na.rm = T)}))[[2]]
+    q3 <- as.vector(aggregate(df$values, by = list(df$group), FUN = function(x) {quantile(x,3/4, na.rm = T)}))[[2]]
+    
+    out <- cbind(summary,
+                 Q1=q1,
+                 Q3=q3,
+                 shapiro_pval = shapiro[,-1],
+                 Anova= c(anova, NA, NA),
+                 t_test_pval = c(NA, ttest),
+                 partial_t_test = c(NA, partover),
+                 Friedman = c(friedman, NA, NA),
+                 wilcoxon_sign_rank_pval = c(NA,wilcoxon))
+    return(out)
+    
+  } else {
+    
+    df <- data.frame(values = values, group = as.character(group))
+    df$group <- factor(group, levels = unique(group))
+    df$id <- factor(as.character(id), levels = unique(id))
+    
+    group <- factor(group, levels = unique(group))
+    ctable <- table(values, group)
+    ctable_perc <- 100*t(t(ctable)/colSums(ctable))
+    ctable_perc <- round(ctable_perc,1)
+
+    df2 <- melt(ctable_perc)
+    p <- ggplot(data = df2, aes(x = group, y = value, fill = values)) +
+      geom_bar(stat = "identity") +
+      ylab("Proportion (%)") +
+      xlab(NULL) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    ggsave(filename = paste(name, "_stacked_bar_plot.pdf",sep=""), plot = p, device = "pdf")
+
+    chi2 <- chisq.test(values, group, correct = F)$p.value
+    
+    pair_mcnemar <- pairwiseMcnemar(data = df, x = values, g = group, block = id, test = "exact", digits = 5, method = "bonferroni", correct = T)$Pairwise[,c("Comparison","p.adjust")]
+    
+    out <- cbind(ctable[,1], ctable_perc[,1],
+                 ctable[,2], ctable_perc[,2],
+                 ctable[,3], ctable_perc[,3],
+                 c(chi2, rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[1,2],rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[2,2],rep(NA, times = nrow(ctable)-1)),
+                 c(pair_mcnemar[3,2],rep(NA, times = nrow(ctable)-1))
+                 )
+    colnames(out) <- c(colnames(ctable)[1],paste(colnames(ctable)[1], "_%",sep=""),
+                       colnames(ctable)[2],paste(colnames(ctable)[2], "_%",sep=""),
+                       colnames(ctable)[3],paste(colnames(ctable)[3], "_%",sep=""),
+                       "Chi2_P", paste("McNemar_p_value ",pair_mcnemar[,1],sep=""))
+    return(out)
+  }
+}
+
+```
+
+```{r}
+group <- function(x1, x2, x3, id) {
+  out <- data.frame(x1 = as.numeric(as.character(x1)),
+                     x2 = as.numeric(as.character(x2)),
+                     x3 = as.numeric(as.character(x3)),
+                     id = id)
+  out <- melt(data = out, id.vars = list("id"))
+  return(out)
+}
+```
+
+```{r}
+groupcat <- function(x1, x2, x3, id) {
+  out <- data.frame(x1 = as.character(x1),
+                     x2 = as.character(x2),
+                     x3 = as.character(x3),
+                     id = id)
+  out <- melt(data = out, id.vars = list("id"))
+  return(out)
+}
+```
+
+# Numerical variables
+
+## SCCAI
+```{r}
+disease <- "ulcerös kolit"
+temp <- group(x1 = data[data$Diagnos == disease,]$SCCAI,
+              x2 = data[data$Diagnos == disease,]$SCCAI_3mån,
+              x3 = data[data$Diagnos == disease,]$SCCAI_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/SCCAI", numeric = T)
+
+temp <- cbind(variable = rep("SCCAI-UC", times = nrow(temp)), temp)
+summary <- temp
+temp
+```
+
+## PRO2-UC
+```{r}
+# disease <- "ulcerös kolit"
+# temp <- group(x1 = data[data$Diagnos == disease,]$SCCAI,
+#               x2 = data[data$Diagnos == disease,]$SCCAI_3mån,
+#               x3 = data[data$Diagnos == disease,]$SCCAI_12mån,
+#               id = data[data$Diagnos == disease,]$Studienummer)
+# temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/PRO2_UC", numeric = T)
+# 
+# temp <- cbind(variable = rep("SCCAI-UC", times = nrow(temp)), temp)
+# summary <- temp
+#temp
+```
+
+
+## HBI-CD
+```{r}
+disease <- "crohns sjukdom"
+temp <- group(x1 = data[data$Diagnos == disease,]$HBI_baseline,
+              x2 = data[data$Diagnos == disease,]$HBI_3mån,
+              x3 = data[data$Diagnos == disease,]$HBI_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/HBI_CD", numeric = T)
+
+temp <- cbind(variable = rep("HBI_CD", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+
+## PRO2-CD
+```{r}
+disease <- "crohns sjukdom"
+temp <- group(x1 = data[data$Diagnos == disease,]$PRO2_CD_Baseline,
+              x2 = data[data$Diagnos == disease,]$PRO2_CD_3mån,
+              x3 = data[data$Diagnos == disease,]$PRO2_CD_12mån,
+              id = data[data$Diagnos == disease,]$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/PRO2_CD", numeric = T)
+temp <- cbind(variable = rep("PRO2_CD", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+
+## Hemoglobin
+```{r}
+temp <- group(x1 = data$Hb_baseline,
+              x2 = data$Hb_mån3,
+              x3 = data$Hb_mån12,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Hb_all", numeric = T)
+
+temp <- cbind(variable = rep("Hb", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+## CRP
+```{r}
+temp <- group(x1 = data$CRP_baseline,
+              x2 = data$CRP_mån3,
+              x3 = data$CRP_mån12,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/CRP_all", numeric = T)
+
+temp <- cbind(variable = rep("CRP", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+## Albumin
+```{r}
+temp <- group(x1 = data$Alb_baseline,
+              x2 = data$Alb_mån3,
+              x3 = data$Alb_mån12,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Albumin_all", numeric = T)
+
+temp <- cbind(variable = rep("Albumin", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+## Calpro
+```{r}
+temp <- group(x1 = data$kalprotektin_baseline,
+              x2 = data$kalprotektin_mån3,
+              x3 = data$Kalpro_mån12,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Calpro_all", numeric = T)
+
+temp <- cbind(variable = rep("Calpro", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+## Vedolizumab
+```{r}
+temp <- group(x1 = data$Vedolizumab_baseline,
+              x2 = data$Vedolizumab_mån3,
+              x3 = data$Vedolizumab_mån12,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Vedo_all", numeric = T)
+
+temp <- cbind(variable = rep("Vedolizumab", times = nrow(temp)), temp)
+summary <- cbind(summary, temp)
+temp
+```
+
+## SAVE Outcomes
+```{r}
+write.table(summary, file = "../Descriptive_stats_table2/Table_2_numerical_data.txt", sep="\t", row.names = T, col.names = NA)
+```
+
+
+# Categorical data
+## Deep remission
+```{r}
+temp <- groupcat(x1 = data$PRO2_kalpro_baseline,
+              x2 = data$PRO2_kalpro_remssion_3mån,
+              x3 = data$PRO2_kalpro_remission_12mån,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Deep_remission_all", numeric = F)
+
+temp <- cbind(variable = rep("Deep_remission_all", times = nrow(temp)), temp)
+summary_cat <- temp
+temp
+```
+
+## Clinical remission
+```{r}
+temp <- groupcat(x1 = data$PRO2CD_UC,
+              x2 = data$PRO2CD_UC_3mån,
+              x3 = data$PRO2CDUC_12mån,
+              id = data$Studienummer)
+temp <- stats(group = temp$variable, values = temp$value, id = temp$id, name = "../Descriptive_stats_table2/Clinical_remission_all", numeric = F)
+
+temp <- cbind(variable = rep("Clinical_remission_all", times = nrow(temp)), temp)
+summary_cat <- cbind(summary_cat, temp)
+temp
+```
+
+## SAVE Outcomes
+```{r}
+write.table(summary_cat, file = "../Descriptive_stats_table2/Table_2_categorical_data.txt", sep="\t", row.names = T, col.names = NA)
+```
+
+
