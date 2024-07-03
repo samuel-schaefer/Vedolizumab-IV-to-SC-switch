@@ -496,7 +496,32 @@ stat.desc(x)
 quantile(x,1/4, na.rm = T)
 quantile(x,3/4, na.rm = T)
 ```
+## SHS composite score
+```{r}
+temp <- cbind(as.numeric(data$SHS_symtom), as.numeric(data$SHS_funktion), as.numeric(data$SHS_oro), as.numeric(data$SHS_vÃ.lbefinnande))
+mode(temp) <- "numeric"
 
+# Make composite score
+temp <- foreach(i = c(1:nrow(temp)), .combine = "c") %do% {
+  if(sum(is.na(temp[i,])) < (ncol(temp)/2)){
+    return(mean(x = temp[i,], na.rm = T))
+  } else {
+    return(NA)
+  }
+}
+
+data$SHS_comopsite_baseline <- temp
+
+# All
+median(data$SHS_comopsite_baseline)
+quantile(data$SHS_comopsite_baseline, 1/4)
+quantile(data$SHS_comopsite_baseline, 3/4)
+
+temp <- stats(group = data$Diagnos, values = data$SHS_comopsite_baseline, name = "../Descriptive_stats/SHS_composite", numeric = T)
+temp <- cbind(variable = rep("SHS_funktion", times = nrow(temp)), temp)
+summary <- rbind(summary, temp)
+temp
+```
 
 ## PRO2 UC
 ```{r}
